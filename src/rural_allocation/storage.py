@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','handler','natural_resources','household')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -194,11 +194,147 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS linkage_projects (
+    project_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'accepting' CHECK(state IN ('accepting','closed')),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS linkage_parcels (
+    parcel_id TEXT PRIMARY KEY,
+    village TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS linkage_parcel_versions (
+    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parcel_id TEXT NOT NULL REFERENCES linkage_parcels(parcel_id),
+    version_no INTEGER NOT NULL,
+    land_use TEXT NOT NULL CHECK(land_use IN ('cultivated','homestead','construction','facility')),
+    area_mu TEXT NOT NULL,
+    within_infrastructure_boundary INTEGER NOT NULL CHECK(within_infrastructure_boundary IN (0,1)),
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','determined')),
+    determined_at TEXT,
+    registered_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    registered_at TEXT NOT NULL,
+    UNIQUE(parcel_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS linkage_protection_batches (
+    batch_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_sha256 TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    rule_count INTEGER NOT NULL,
+    imported_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    imported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS linkage_protection_rules (
+    rule_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL REFERENCES linkage_protection_batches(batch_id),
+    parcel_id TEXT NOT NULL REFERENCES linkage_parcels(parcel_id),
+    rule_type TEXT NOT NULL CHECK(rule_type IN ('permanent_basic_farmland','use_control')),
+    restricted_use TEXT CHECK(restricted_use IS NULL OR restricted_use IN ('cultivated','homestead','construction','facility')),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_linkage_rules_parcel
+ON linkage_protection_rules(parcel_id, effective_from);
+
+CREATE TABLE IF NOT EXISTS linkage_households (
+    household_id TEXT PRIMARY KEY,
+    head_name TEXT NOT NULL,
+    village TEXT NOT NULL,
+    authorized_scope TEXT NOT NULL,
+    authorized_until TEXT NOT NULL,
+    reclamation_commitment_deadline TEXT NOT NULL,
+    commitment_note TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS linkage_household_members (
+    member_id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL REFERENCES linkage_households(household_id),
+    name TEXT NOT NULL,
+    qualified INTEGER NOT NULL DEFAULT 1 CHECK(qualified IN (0,1)),
+    withdrawn_reason TEXT,
+    withdrawn_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_linkage_members_household
+ON linkage_household_members(household_id);
+
+CREATE TABLE IF NOT EXISTS linkage_household_users (
+    user_id TEXT PRIMARY KEY REFERENCES supply_users(user_id),
+    household_id TEXT NOT NULL REFERENCES linkage_households(household_id)
+);
+
+CREATE TABLE IF NOT EXISTS linkage_withdrawals (
+    withdrawal_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES linkage_projects(project_id),
+    household_id TEXT NOT NULL REFERENCES linkage_households(household_id),
+    homestead_parcel_id TEXT NOT NULL REFERENCES linkage_parcels(parcel_id),
+    supplementary_parcel_id TEXT NOT NULL REFERENCES linkage_parcels(parcel_id),
+    state TEXT NOT NULL DEFAULT 'accepted' CHECK(state IN ('accepted','cancelled')),
+    checks_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_linkage_withdrawals_household
+ON linkage_withdrawals(household_id);
+
+CREATE TABLE IF NOT EXISTS linkage_candidate_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    withdrawal_id TEXT NOT NULL REFERENCES linkage_withdrawals(withdrawal_id),
+    purpose TEXT NOT NULL CHECK(purpose IN ('resettlement','contracted-land')),
+    input_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_linkage_candidate_runs_withdrawal
+ON linkage_candidate_runs(withdrawal_id);
+
+CREATE TABLE IF NOT EXISTS linkage_plans (
+    plan_id TEXT PRIMARY KEY,
+    withdrawal_id TEXT NOT NULL REFERENCES linkage_withdrawals(withdrawal_id),
+    project_id TEXT NOT NULL REFERENCES linkage_projects(project_id),
+    household_id TEXT NOT NULL REFERENCES linkage_households(household_id),
+    resettlement_parcel_id TEXT NOT NULL REFERENCES linkage_parcels(parcel_id),
+    resettlement_version_id INTEGER NOT NULL REFERENCES linkage_parcel_versions(version_id),
+    land_parcel_id TEXT NOT NULL REFERENCES linkage_parcels(parcel_id),
+    land_version_id INTEGER NOT NULL REFERENCES linkage_parcel_versions(version_id),
+    protection_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft'
+        CHECK(state IN ('draft','confirmed','in_construction','delivered','blocked','manual_review')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    state_reason TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    delivered_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_linkage_plans_household
+ON linkage_plans(household_id, state);
 """
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 在 worker 线程中处理请求，连接需要允许跨线程使用；
+    # SQLite 以串行模式编译，配合 BEGIN IMMEDIATE 事务保证写入串行化。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

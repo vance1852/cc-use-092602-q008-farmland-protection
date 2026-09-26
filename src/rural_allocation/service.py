@@ -34,7 +34,10 @@ ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "linkage.read"},
+    "handler": {"household.write", "withdrawal.write", "plan.write", "candidate.run", "linkage.read"},
+    "natural_resources": {"project.write", "parcel.write", "protection.import", "qualification.withdraw", "linkage.read"},
+    "household": {"household.self.read"},
 }
 
 

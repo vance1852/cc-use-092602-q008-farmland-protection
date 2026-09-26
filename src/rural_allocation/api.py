@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .errors import SupplyError, ValidationFailed
+from .linkage import LinkageService
 from .service import SupplyService
 from .storage import connect
 
@@ -22,8 +23,9 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
+    def __init__(self, service: SupplyService, linkage: LinkageService | None = None) -> None:
         self.service = service
+        self.linkage = linkage
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -85,11 +87,67 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if self.linkage is not None:
+                linked = self._linkage_route(self.linkage, method, path, parts, actor, payload)
+                if linked is not None:
+                    return linked
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
+
+    @staticmethod
+    def _linkage_route(
+        linkage: LinkageService,
+        method: str,
+        path: str,
+        parts: list[str],
+        actor: str,
+        payload: Mapping[str, Any],
+    ) -> Response | None:
+        if len(parts) < 2 or parts[0] != "linkage":
+            return None
+        section = parts[1]
+        if method == "POST" and path == "/linkage/projects":
+            return Response(201, linkage.create_project(actor, payload))
+        if method == "POST" and path == "/linkage/parcels":
+            return Response(201, linkage.register_parcel(actor, payload))
+        if method == "POST" and len(parts) == 4 and section == "parcels" and parts[3] == "versions":
+            return Response(201, linkage.add_parcel_version(actor, parts[2], payload))
+        if method == "POST" and len(parts) == 6 and section == "parcels" and parts[3] == "versions" and parts[5] == "determine":
+            return Response(200, linkage.determine_parcel_version(actor, parts[2], int(parts[4])))
+        if method == "POST" and path == "/linkage/protection-rules/import":
+            return Response(201, linkage.import_protection_rules(actor, payload))
+        if method == "POST" and path == "/linkage/households":
+            return Response(201, linkage.register_household(actor, payload))
+        if method == "POST" and path == "/linkage/household-users":
+            return Response(201, linkage.link_household_user(actor, payload))
+        if method == "POST" and len(parts) == 4 and section == "members" and parts[3] == "withdraw-qualification":
+            return Response(200, linkage.withdraw_qualification(actor, parts[2], payload["reason"]))
+        if method == "POST" and path == "/linkage/withdrawals":
+            return Response(201, linkage.accept_withdrawal(actor, payload))
+        if method == "POST" and len(parts) == 4 and section == "withdrawals" and parts[3] == "candidates":
+            return Response(200, linkage.generate_candidates(actor, parts[2], payload["purpose"]))
+        if method == "POST" and path == "/linkage/plans":
+            return Response(201, linkage.create_plan(actor, payload))
+        if method == "POST" and len(parts) == 4 and section == "plans":
+            revision = payload["expected_revision"]
+            if parts[3] == "confirm":
+                return Response(200, linkage.confirm_plan(actor, parts[2], revision))
+            if parts[3] == "start-construction":
+                return Response(200, linkage.start_construction(actor, parts[2], revision))
+            if parts[3] == "deliver":
+                return Response(200, linkage.deliver_plan(actor, parts[2], revision))
+        if method == "GET" and len(parts) == 3 and section == "withdrawals":
+            return Response(200, linkage.withdrawal_view(actor, parts[2]))
+        if method == "GET" and len(parts) == 3 and section == "plans":
+            return Response(200, linkage.plan_view(actor, parts[2]))
+        if method == "GET" and len(parts) == 3 and section == "candidate-runs":
+            return Response(200, linkage.candidate_run_view(actor, int(parts[2])))
+        if method == "GET" and len(parts) == 3 and section == "households":
+            return Response(200, linkage.household_view(actor, parts[2]))
+        return None
 
 
 def make_handler(application: JsonApplication):
@@ -126,7 +184,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    application = JsonApplication(SupplyService(connection), LinkageService(connection))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(application))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
